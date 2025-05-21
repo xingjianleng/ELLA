@@ -245,7 +245,7 @@ def main():
     mean_dpg_score = np.mean(global_dpg_scores)
 
     global_categories = gather_object(list(local_category2scores.keys()))
-    global_categories = set(k for sub in global_categories for k in sub)
+    global_categories = set(k for k in global_categories)
     global_category2scores = dict()
     global_average_scores = []
     for category in global_categories:
