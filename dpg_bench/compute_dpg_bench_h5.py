@@ -1,9 +1,11 @@
 import argparse
+import io
 import os
 import os.path as osp
 import time
 from collections import defaultdict
 
+import h5py
 import numpy as np
 import pandas as pd
 import torch
@@ -13,27 +15,45 @@ from PIL import Image
 from tqdm import tqdm
 
 
+def get_all_datasets(h5_file):
+    dataset_paths = []
+
+    def visitor(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            dataset_paths.append(name)
+
+    h5_file.visititems(visitor)
+    return dataset_paths
+
+
+def load_h5(h5f, filename):
+    if filename.endswith(".png") or filename.endswith(".jpg"):
+        return Image.open(io.BytesIO(np.array(h5f[filename])))
+    else:
+        raise ValueError(f"Unsupported file type: {filename}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="DPG-Bench evaluation.")
     parser.add_argument(
-        "--image-root-path",
+        "--h5-path",
         type=str,
-        default=None,
+        required=True,
     )
     parser.add_argument(
         "--resolution",
         type=int,
-        default=None,
+        required=True,
+    )
+    parser.add_argument(
+        "--res-path",
+        type=str,
+        required=True,
     )
     parser.add_argument(
         "--csv",
         type=str,
         default='./dpg_bench/dpg_bench.csv',
-    )
-    parser.add_argument(
-        "--res-path",
-        type=str,
-        default=None,
     )
     parser.add_argument(
         "--pic-num",
@@ -51,7 +71,7 @@ def parse_args():
 
 
 class MPLUG(torch.nn.Module):
-    def __init__(self, ckpt='damo/mplug_visual-question-answering_coco_large_en', device='gpu'):
+    def __init__(self, ckpt='checkpoints/mplug_visual-question-answering_coco_large_en', device='gpu'):
         super().__init__()
         from modelscope.pipelines import pipeline
         from modelscope.utils.constant import Tasks
@@ -109,8 +129,8 @@ def crop_image(input_image, crop_tuple=None):
     return cropped_image
 
 
-def compute_dpg_one_sample(args, question_dict, image_path, vqa_model, resolution):
-    generated_image = Image.open(image_path)
+def compute_dpg_one_sample(args, question_dict, h5f, image_path, vqa_model, resolution):
+    generated_image = load_h5(h5f, image_path)
     crop_tuples_list = [
         (0,0,resolution,resolution),
         (resolution, 0, resolution*2, resolution),
@@ -179,11 +199,6 @@ def main():
 
     question_dict = prepare_dpg_data(args)
 
-    timestamp = time.time()
-    time_array = time.localtime(timestamp)
-    time_style = time.strftime("%Y%m%d-%H%M%S", time_array)
-    if args.res_path is None:
-        args.res_path = osp.join(args.image_root_path, f'dpg-bench_{time_style}_results.txt')
     if accelerator.is_main_process:
         with open(args.res_path, 'w') as f:
             pass
@@ -198,21 +213,20 @@ def main():
     vqa_model = accelerator.prepare(vqa_model)
     vqa_model = getattr(vqa_model, 'module', vqa_model) 
 
-    filename_list = os.listdir(args.image_root_path)
+    h5f = h5py.File(args.h5_path, 'r')
+    filename_list = [f for f in get_all_datasets(h5f) if f.endswith('.png') or f.endswith('.jpg')]
     num_each_rank = len(filename_list) / accelerator.num_processes
     local_rank = accelerator.process_index
     local_filename_list = filename_list[round(local_rank * num_each_rank) : round((local_rank + 1) * num_each_rank)]
 
     local_scores = []
     local_category2scores = defaultdict(list)
-    model_id = osp.basename(args.image_root_path)
-    print(f'Start to conduct evaluation of {model_id}')
+    print(f'Start to conduct evaluation of {args.h5_path}')
     for fn in tqdm(local_filename_list):
-        image_path = osp.join(args.image_root_path, fn)
         try:
             # compute score of one sample
             score, qid2tuple, qid2scores = compute_dpg_one_sample(
-                args=args, question_dict=question_dict, image_path=image_path, vqa_model=vqa_model, resolution=args.resolution)
+                args=args, question_dict=question_dict, h5f=h5f, image_path=fn, vqa_model=vqa_model, resolution=args.resolution)
             local_scores.append(score)
             
             # summarize scores by categoris
@@ -224,7 +238,8 @@ def main():
         except Exception as e:
             print('Failed filename:', fn, e)
             continue
-    
+
+    h5f.close()
     accelerator.wait_for_everyone()
     global_dpg_scores = gather_object(local_scores)
     mean_dpg_score = np.mean(global_dpg_scores)
@@ -245,7 +260,7 @@ def main():
 
     time.sleep(3)
     if accelerator.is_main_process:
-        output = f'Model: {model_id}\n'
+        output = f'Model: {args.h5_path}\n'
         
         output += 'L1 category scores:\n'
         for l1_category in global_category2scores_l1.keys():
@@ -255,7 +270,7 @@ def main():
         for category in sorted(global_categories):
             output += f'\t{category}: {np.mean(global_category2scores[category]) * 100}\n'
 
-        output += f'Image path: {args.image_root_path}\n'
+        output += f'Image path: {args.h5_path}\n'
         output += f'Save results to: {args.res_path}\n'
         output += f'DPG-Bench score: {mean_dpg_score * 100}'
         with open(args.res_path, 'a') as f:
