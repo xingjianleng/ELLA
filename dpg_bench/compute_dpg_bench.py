@@ -51,7 +51,7 @@ def parse_args():
 
 
 class MPLUG(torch.nn.Module):
-    def __init__(self, ckpt='damo/mplug_visual-question-answering_coco_large_en', device='gpu'):
+    def __init__(self, ckpt='checkpoints/mplug_visual-question-answering_coco_large_en', device='gpu'):
         super().__init__()
         from modelscope.pipelines import pipeline
         from modelscope.utils.constant import Tasks
@@ -126,13 +126,11 @@ def compute_dpg_one_sample(args, question_dict, image_path, vqa_model, resolutio
     qid2dependency = value['qid2dependency']
 
     qid2answer = dict()
+    qid2scores = dict()
     qid2validity = dict()
-    per_crop_qid_scores = []
 
     scores = []
     for crop_tuple in crop_tuples:
-        qid2scores = dict()
-
         cropped_image = crop_image(generated_image, crop_tuple)
         for id, question in qid2question.items():
             answer = vqa_model.vqa(cropped_image, question)
@@ -140,6 +138,7 @@ def compute_dpg_one_sample(args, question_dict, image_path, vqa_model, resolutio
             qid2scores[id] = float(answer == 'yes')
             with open(args.res_path.replace('.txt', '_detail.txt'), 'a') as f:
                 f.write(image_path + ', ' + str(crop_tuple) + ', ' + question + ', ' + answer + '\n')
+        qid2scores_orig = qid2scores.copy()
 
         for id, parent_ids in qid2dependency.items():
             # zero-out scores if parent questions are answered 'no'
@@ -156,20 +155,13 @@ def compute_dpg_one_sample(args, question_dict, image_path, vqa_model, resolutio
             else:
                 qid2validity[id] = True
 
-        per_crop_qid_scores.append(qid2scores.copy())
-
         score = sum(qid2scores.values()) / len(qid2scores)
         scores.append(score)
     average_score = sum(scores) / len(scores)
     with open(args.res_path, 'a') as f:
         f.write(image_path + ', ' + ', '.join(str(i) for i in scores) + ', ' + str(average_score) + '\n')
-
-    merged_qid2scores = {
-        qid: sum(d[qid] for d in per_crop_qid_scores) / len(per_crop_qid_scores)
-        for qid in qid2tuple
-    }
-
-    return average_score, qid2tuple, merged_qid2scores
+  
+    return average_score, qid2tuple, qid2scores_orig
 
 
 def main():
@@ -224,13 +216,13 @@ def main():
         except Exception as e:
             print('Failed filename:', fn, e)
             continue
-    
+
     accelerator.wait_for_everyone()
     global_dpg_scores = gather_object(local_scores)
     mean_dpg_score = np.mean(global_dpg_scores)
 
     global_categories = gather_object(list(local_category2scores.keys()))
-    global_categories = set(k for sub in global_categories for k in sub)
+    global_categories = set(global_categories)
     global_category2scores = dict()
     global_average_scores = []
     for category in global_categories:
